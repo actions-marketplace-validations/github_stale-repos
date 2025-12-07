@@ -1,16 +1,20 @@
 #!/usr/bin/env python
-""" Find stale repositories in a GitHub organization. """
+"""Find stale repositories in a GitHub organization."""
 
+import fnmatch
+import json
 import os
 from datetime import datetime, timezone
-from os.path import dirname, join
 
 import github3
 from dateutil.parser import parse
-from dotenv import load_dotenv
+from env import get_env_vars
+
+import auth
+from markdown import write_to_markdown
 
 
-def main():
+def main():  # pragma: no cover
     """
     Iterate over all repositories in the specified organization on GitHub,
     calculate the number of days since each repository was last pushed to,
@@ -27,12 +31,25 @@ def main():
     """
     print("Starting stale repo search...")
 
-    # Load env variables from file
-    dotenv_path = join(dirname(__file__), ".env")
-    load_dotenv(dotenv_path)
+    env_vars = get_env_vars()
+    token = env_vars.gh_token
+    gh_app_id = env_vars.gh_app_id
+    gh_app_installation_id = env_vars.gh_app_installation_id
+    gh_app_private_key_bytes = env_vars.gh_app_private_key_bytes
+    ghe = env_vars.ghe
+    gh_app_enterprise_only = env_vars.gh_app_enterprise_only
+    skip_empty_reports = env_vars.skip_empty_reports
+    workflow_summary_enabled = env_vars.workflow_summary_enabled
 
-    # Auth to GitHub.com
-    github_connection = auth_to_github()
+    # Auth to GitHub.com or GHE
+    github_connection = auth.auth_to_github(
+        token,
+        gh_app_id,
+        gh_app_installation_id,
+        gh_app_private_key_bytes,
+        ghe,
+        gh_app_enterprise_only,
+    )
 
     # Set the threshold for inactive days
     inactive_days_threshold = os.getenv("INACTIVE_DAYS")
@@ -42,19 +59,65 @@ def main():
     # Set the organization
     organization = os.getenv("ORGANIZATION")
     if not organization:
-        raise ValueError("ORGANIZATION environment variable not set")
+        print(
+            "ORGANIZATION environment variable not set, searching all repos owned by token owner"
+        )
+
+    # Fetch additional metrics configuration
+    additional_metrics = os.getenv("ADDITIONAL_METRICS", "").split(",")
 
     # Iterate over repos in the org, acquire inactive days,
     # and print out the repo url and days inactive if it's over the threshold (inactive_days)
     inactive_repos = get_inactive_repos(
-        github_connection, inactive_days_threshold, organization
+        github_connection, inactive_days_threshold, organization, additional_metrics
     )
 
-    # Write the list of inactive repos to a csv file
-    write_to_markdown(inactive_repos)
+    if inactive_repos or not skip_empty_reports:
+        output_to_json(inactive_repos)
+        write_to_markdown(
+            inactive_repos,
+            inactive_days_threshold,
+            additional_metrics,
+            workflow_summary_enabled,
+        )
+    else:
+        print("Reporting skipped; no stale repos found.")
 
 
-def get_inactive_repos(github_connection, inactive_days_threshold, organization):
+def is_repo_exempt(repo, exempt_repos, exempt_topics):
+    """Check if a repo is exempt from the stale repo check.
+
+    Args:
+        repo: The repository to check.
+        exempt_repos: A list of repos to exempt from the stale repo check.
+        exempt_topics: A list of topics to exempt from the stale repo check.
+
+    Returns:
+        True if the repo is exempt from the stale repo check, False otherwise.
+    """
+    if exempt_repos and any(
+        fnmatch.fnmatchcase(repo.name, pattern) for pattern in exempt_repos
+    ):
+        print(f"{repo.html_url} is exempt from stale repo check")
+        return True
+    try:
+        if exempt_topics and any(
+            topic in exempt_topics for topic in repo.topics().names
+        ):
+            print(f"{repo.html_url} is exempt from stale repo check")
+            return True
+    except github3.exceptions.NotFoundError as error_code:
+        if error_code.code == 404:
+            print(
+                f"{repo.html_url} does not have topics enabled and may be a private temporary fork"
+            )
+
+    return False
+
+
+def get_inactive_repos(
+    github_connection, inactive_days_threshold, organization, additional_metrics=None
+):
     """Return and print out the repo url and days inactive if it's over
        the threshold (inactive_days).
 
@@ -62,57 +125,227 @@ def get_inactive_repos(github_connection, inactive_days_threshold, organization)
         github_connection: The GitHub connection object.
         inactive_days_threshold: The threshold (in days) for considering a repo as inactive.
         organization: The name of the organization to retrieve repositories from.
+        additional_metrics: A list of additional metrics to include in the report.
 
     Returns:
-        A list of tuples containing the repo and days inactive.
+        A list of tuples containing the repo, days inactive, the date of the last push and
+        repository visibility (public/private).
 
     """
     inactive_repos = []
-    for repo in github_connection.repositories_by(organization):
-        last_push_str = repo.pushed_at  # type: ignore
-        if last_push_str is None:
+    if organization:
+        repos = github_connection.organization(organization).repositories()
+    else:
+        repos = github_connection.repositories(type="owner")
+
+    exempt_topics = os.getenv("EXEMPT_TOPICS")
+    if exempt_topics:
+        exempt_topics = exempt_topics.replace(" ", "").split(",")
+        print(f"Exempt topics: {exempt_topics}")
+
+    exempt_repos = os.getenv("EXEMPT_REPOS")
+    if exempt_repos:
+        exempt_repos = exempt_repos.replace(" ", "").split(",")
+        print(f"Exempt repos: {exempt_repos}")
+
+    for repo in repos:
+        # check if repo is exempt from stale repo check
+        if repo.archived:
             continue
-        last_push = parse(last_push_str)
-        days_inactive = (datetime.now(timezone.utc) - last_push).days
-        if days_inactive > int(inactive_days_threshold) and not repo.archived:
-            inactive_repos.append((repo.html_url, days_inactive))
-            print(f"{repo.html_url}: {days_inactive} days inactive")  # type: ignore
-    print(f"Found {len(inactive_repos)} stale repos in {organization}")
+        if is_repo_exempt(repo, exempt_repos, exempt_topics):
+            continue
+
+        # Get last active date
+        active_date = get_active_date(repo)
+        if active_date is None:
+            continue
+
+        active_date_disp = active_date.date().isoformat()
+        days_inactive = (datetime.now(timezone.utc) - active_date).days
+        visibility = "private" if repo.private else "public"
+        if days_inactive > int(inactive_days_threshold):
+            repo_data = set_repo_data(
+                repo, days_inactive, active_date_disp, visibility, additional_metrics
+            )
+            inactive_repos.append(repo_data)
+    if organization:
+        print(f"Found {len(inactive_repos)} stale repos in {organization}")
+    else:
+        print(f"Found {len(inactive_repos)} stale repos")
     return inactive_repos
 
 
-def write_to_markdown(inactive_repos, file=None):
-    """Write the list of inactive repos to a markdown file.
+def get_days_since_last_release(repo):
+    """Get the number of days since the last release of the repository.
 
     Args:
-        inactive_repos: A list of tuples containing the repo and days inactive.
-        file: A file object to write to. If None, a new file will be created.
+        repo: A Github repository object.
+
+    Returns:
+        The number of days since the last release.
+    """
+    try:
+        last_release = next(repo.releases())
+        return (datetime.now(timezone.utc) - last_release.created_at).days
+    except TypeError:
+        print(
+            f"{repo.html_url} had an exception trying to get the last release.\
+            Potentially caused by ghost user."
+        )
+        return None
+    except StopIteration:
+        return None
+
+
+def get_days_since_last_pr(repo):
+    """Get the number of days since the last pull request was made in the repository.
+
+    Args:
+        repo: A Github repository object.
+
+    Returns:
+        The number of days since the last pull request was made.
+    """
+    try:
+        last_pr = next(repo.pull_requests(state="all"))
+        return (datetime.now(timezone.utc) - last_pr.created_at).days
+    except StopIteration:
+        return None
+
+
+def get_active_date(repo):
+    """Get the last activity date of the repository.
+
+    Args:
+        repo: A Github repository object.
+
+    Returns:
+        A date object representing the last activity date of the repository.
+    """
+    activity_method = os.getenv("ACTIVITY_METHOD", "pushed").lower()
+    try:
+        if activity_method == "default_branch_updated":
+            commit = repo.branch(repo.default_branch).commit
+            active_date = parse(commit.commit.as_dict()["committer"]["date"])
+        elif activity_method == "pushed":
+            last_push_str = repo.pushed_at  # type: ignore
+            if last_push_str is None:
+                return None
+            active_date = parse(last_push_str)
+        else:
+            raise ValueError(
+                f"""
+                ACTIVITY_METHOD environment variable has unsupported value: '{activity_method}'.
+                Allowed values are: 'pushed' and 'default_branch_updated'
+                """
+            )
+    except github3.exceptions.GitHubException:
+        print(
+            f"{repo.html_url} had an exception trying to get the activity date.\
+ Potentially caused by ghost user."
+        )
+        return None
+    return active_date
+
+
+def output_to_json(inactive_repos, file=None):
+    """Convert the list of inactive repos to a json string.
+
+    Args:
+        inactive_repos: A list of dictionaries containing the repo,
+            days inactive, the date of the last push,
+            visiblity of the repository (public/private),
+            days since the last release, and days since the last pr.
+
+    Returns:
+        JSON formatted string of the list of inactive repos.
 
     """
-    inactive_repos.sort(key=lambda x: x[1], reverse=True)
-    with file or open("stale_repos.md", "w", encoding="utf-8") as file:
-        file.write("# Inactive Repositories\n\n")
-        file.write("| Repository URL | Days Inactive |\n")
-        file.write("| --- | ---: |\n")
-        for repo_url, days_inactive in inactive_repos:
-            file.write(f"| {repo_url} | {days_inactive} |\n")
-    print("Wrote stale repos to stale_repos.md")
+    # json structure is like following
+    # [
+    #   {
+    #     "url": "https://github.com/owner/repo",
+    #     "daysInactive": 366,
+    #     "lastPushDate": "2020-01-01"
+    #     "daysSinceLastRelease": "5"
+    #     "daysSinceLastPR": "10"
+    #   }
+    # ]
+    inactive_repos_json = []
+    for repo_data in inactive_repos:
+        repo_json = {
+            "url": repo_data["url"],
+            "daysInactive": repo_data["days_inactive"],
+            "lastPushDate": repo_data["last_push_date"],
+            "visibility": repo_data["visibility"],
+        }
+        if "release" in repo_data:
+            repo_json["daysSinceLastRelease"] = repo_data["days_since_last_release"]
+        if "pr" in repo_data:
+            repo_json["daysSinceLastPR"] = repo_data["days_since_last_pr"]
+        inactive_repos_json.append(repo_json)
+    inactive_repos_json = json.dumps(inactive_repos_json)
+
+    # add output to github action output
+    # pylint: disable=unspecified-encoding
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a") as file_handle:
+            print(f"inactiveRepos={inactive_repos_json}", file=file_handle)
+
+    with file or open("stale_repos.json", "w", encoding="utf-8") as json_file:
+        json_file.write(inactive_repos_json)
+
+    print("Wrote stale repos to stale_repos.json")
+
+    return inactive_repos_json
 
 
-def auth_to_github():
-    """Connect to GitHub.com or GitHub Enterprise, depending on env variables."""
-    ghe = os.getenv("GH_ENTERPRISE_URL", default="").strip()
-    token = os.getenv("GH_TOKEN")
-    if ghe and token:
-        github_connection = github3.github.GitHubEnterprise(ghe, token=token)
-    elif token:
-        github_connection = github3.login(token=os.getenv("GH_TOKEN"))
-    else:
-        raise ValueError("GH_TOKEN environment variable not set")
+def set_repo_data(
+    repo, days_inactive, active_date_disp, visibility, additional_metrics
+):
+    """
+    Constructs a dictionary with repository data
+    including optional metrics based on additional metrics specified.
 
-    if not github_connection:
-        raise ValueError("Unable to authenticate to GitHub")
-    return github_connection  # type: ignore
+    Args:
+        repo: The repository object.
+        days_inactive: Number of days the repository has been inactive.
+        active_date_disp: The display string of the last active date.
+        visibility: The visibility status of the repository (e.g., private or public).
+        additional_metrics: A list of strings indicating which additional metrics to include.
+
+    Returns:
+        A dictionary with the repository data.
+    """
+    repo_data = {
+        "url": repo.html_url,
+        "days_inactive": days_inactive,
+        "last_push_date": active_date_disp,
+        "visibility": visibility,
+    }
+    # Fetch and include additional metrics if configured
+    repo_data["days_since_last_release"] = None
+    repo_data["days_since_last_pr"] = None
+    if additional_metrics:
+        if "release" in additional_metrics:
+            try:
+                repo_data["days_since_last_release"] = get_days_since_last_release(repo)
+            except github3.exceptions.GitHubException:
+                print(
+                    f"{repo.html_url} had an exception trying to get the last release.\
+ Potentially caused by ghost user."
+                )
+        if "pr" in additional_metrics:
+            try:
+                repo_data["days_since_last_pr"] = get_days_since_last_pr(repo)
+            except github3.exceptions.GitHubException:
+                print(
+                    f"{repo.html_url} had an exception trying to get the last PR.\
+ Potentially caused by ghost user."
+                )
+
+    print(f"{repo.html_url} {days_inactive} days inactive")  # type: ignore
+    return repo_data
 
 
 if __name__ == "__main__":

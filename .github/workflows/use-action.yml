@@ -1,38 +1,36 @@
+---
 name: stale repo identifier
-
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
   schedule:
-    - cron: '3 2 1 * *'
-
+    - cron: "3 2 1 * *"
 permissions:
   contents: read
-  issues: write
-  packages: read
-
 jobs:
   build:
     name: stale repo identifier
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: read
+      issues: write
+      packages: read
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-    
-    - name: Run stale_repos tool
-      uses: docker://ghcr.io/github/stale_repos:v1
-      env:
-        GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        ORGANIZATION: github
-        INACTIVE_DAYS: 1
-
-    - name: Create issue
-      uses: peter-evans/create-issue-from-file@v4
-      with:
-        title: Stale repository report
-        content-filepath: ./stale_repos.md
-        assignees: zkoppert
+      - name: Checkout code
+        uses: actions/checkout@v6.0.0
+        with:
+          persist-credentials: false
+      - name: Run stale_repos tool
+        uses: docker://ghcr.io/github/stale_repos:v6
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          ORGANIZATION: github
+          INACTIVE_DAYS: 1
+      - name: Create issue
+        uses: peter-evans/create-issue-from-file@fca9117c27cdc29c6c4db3b86c48e4115a786710
+        with:
+          title: Stale repository report
+          content-filepath: ./stale_repos.md
+          assignees: zkoppert

@@ -1,9 +1,14 @@
 # Output files
+stale_repos.md
+stale_repos.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# asdf
+.tool-versions
 
 # C extensions
 *.so
@@ -138,3 +143,11 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# IDEA
+.idea/**
+
+# Node.js
+node_modules/
+package-lock.json
+package.json

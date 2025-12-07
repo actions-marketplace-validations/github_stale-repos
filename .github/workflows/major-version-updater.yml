@@ -1,0 +1,38 @@
+name: Update major tag for release
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      TAG_NAME:
+        description: "Tag name that the major tag will point to (e.g. v1.2.3)"
+        required: true
+env:
+  TAG_NAME: ${{ github.event.inputs.TAG_NAME || github.ref}}
+permissions:
+  contents: write
+jobs:
+  update_tag:
+    name: Update the major tag to include the ${{ github.event.inputs.TAG_NAME || github.ref }} changes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v6.0.0
+        with:
+          fetch-tags: true
+          ref: ${{ github.event.inputs.TAG_NAME || github.ref }}
+          persist-credentials: false
+      - name: version
+        id: version
+        run: |
+          tag=${TAG_NAME/refs\/tags\//}
+          version=${tag#v}
+          major=${version%%.*}
+          { echo "tag=${tag}"; echo "version=${version}"; echo "major=${major}"; } >> "$GITHUB_OUTPUT"
+      - name: force update major tag
+        run: |
+          git tag -f v${STEPS_VERSION_OUTPUTS_MAJOR} ${STEPS_VERSION_OUTPUTS_TAG}
+          git push -f origin v${STEPS_VERSION_OUTPUTS_MAJOR}
+        env:
+          STEPS_VERSION_OUTPUTS_MAJOR: ${{ steps.version.outputs.major }}
+          STEPS_VERSION_OUTPUTS_TAG: ${{ steps.version.outputs.tag }}
